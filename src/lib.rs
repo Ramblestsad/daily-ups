@@ -121,10 +121,14 @@ pub fn run_with_home(cli: Cli, home: PathBuf) -> Result<RunSummary, AppError> {
 
     logger.line_colored("daily-ups", Tone::Header);
     logger.line(&format!("started: {}", timestamp()?));
-    logger.line_colored(
-        mode_label(cli.dry_run, cli.deep, jobs).as_str(),
-        Tone::Muted,
-    );
+    let mode = if cli.dry_run {
+        format!("Mode: dry-run, project jobs: {jobs}")
+    } else if cli.deep {
+        format!("Mode: deep, project jobs: {jobs}")
+    } else {
+        format!("Mode: default, project jobs: {jobs}")
+    };
+    logger.line_colored(&mode, Tone::Muted);
 
     if let Some(record) = log_failure {
         records.push(record);
@@ -149,7 +153,7 @@ pub fn run_with_home(cli: Cli, home: PathBuf) -> Result<RunSummary, AppError> {
         records.extend(output.records);
     }
 
-    let summary = summarize(records, logger.path().map(Path::to_path_buf));
+    let summary = summarize(records, logger.path.clone());
     print_summary(&mut logger, &summary, cli.dry_run);
 
     Ok(summary)
@@ -167,16 +171,6 @@ fn validate_jobs(jobs: usize) -> Result<usize, AppError> {
         Err(AppError::InvalidJobs)
     } else {
         Ok(jobs)
-    }
-}
-
-fn mode_label(dry_run: bool, deep: bool, jobs: usize) -> String {
-    if dry_run {
-        format!("Mode: dry-run, project jobs: {jobs}")
-    } else if deep {
-        format!("Mode: deep, project jobs: {jobs}")
-    } else {
-        format!("Mode: default, project jobs: {jobs}")
     }
 }
 
@@ -215,10 +209,6 @@ impl Logger {
                 )),
             )),
         }
-    }
-
-    fn path(&self) -> Option<&Path> {
-        self.path.as_deref()
     }
 
     fn line(&mut self, line: &str) {
@@ -369,7 +359,11 @@ fn run_parallel(dry_run: bool, deep: bool, jobs: usize, home: &Path) -> Vec<Work
     let project_handle = thread::spawn(move || run_projects(project_bars, jobs, dry_run));
 
     let mut tool_outputs = join_indexed_outputs(tool_handles);
-    tool_outputs.push(join_output("Projects", project_handle));
+    let project_output = match project_handle.join() {
+        Ok(output) => output,
+        Err(_) => panic_output("Projects", "worker panicked"),
+    };
+    tool_outputs.push(project_output);
     tool_outputs
 }
 
@@ -397,13 +391,6 @@ fn join_indexed_outputs(handles: Vec<thread::JoinHandle<(usize, WorkOutput)>>) -
 
     outputs.sort_by_key(|(index, _)| *index);
     outputs.into_iter().map(|(_, output)| output).collect()
-}
-
-fn join_output(name: &'static str, handle: thread::JoinHandle<WorkOutput>) -> WorkOutput {
-    match handle.join() {
-        Ok(output) => output,
-        Err(_) => panic_output(name, "worker panicked"),
-    }
 }
 
 fn panic_output(name: &'static str, reason: &'static str) -> WorkOutput {
@@ -614,8 +601,16 @@ fn run_command(command: &CommandSpec, current_dir: Option<&Path>) -> Result<Stri
         .map_err(|error| format!("failed to start `{}`: {error}", command.display()))?;
 
     let mut log = String::new();
-    append_output(&mut log, &output.stdout);
-    append_output(&mut log, &output.stderr);
+    for bytes in [&output.stdout, &output.stderr] {
+        if bytes.is_empty() {
+            continue;
+        }
+
+        log.push_str(&String::from_utf8_lossy(bytes));
+        if !log.ends_with('\n') {
+            log.push('\n');
+        }
+    }
 
     if output.status.success() {
         Ok(log)
@@ -625,17 +620,6 @@ fn run_command(command: &CommandSpec, current_dir: Option<&Path>) -> Result<Stri
             .code()
             .map_or_else(|| "signal".to_string(), |code| code.to_string());
         Err(format!("`{}` exited with {code}", command.display()))
-    }
-}
-
-fn append_output(log: &mut String, bytes: &[u8]) {
-    if bytes.is_empty() {
-        return;
-    }
-
-    log.push_str(&String::from_utf8_lossy(bytes));
-    if !log.ends_with('\n') {
-        log.push('\n');
     }
 }
 
