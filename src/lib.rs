@@ -20,7 +20,7 @@ pub struct Cli {
     #[arg(long)]
     pub deep: bool,
 
-    #[arg(long, default_value_t = 2)]
+    #[arg(long, default_value_t = 4)]
     pub jobs: usize,
 }
 
@@ -686,16 +686,17 @@ fn tool_groups() -> Vec<WorkGroup> {
         },
         WorkGroup {
             name: "Node",
-            commands: vec![
-                CommandSpec {
-                    program: "pnpm",
-                    args: &["up", "-g"],
-                },
-                CommandSpec {
-                    program: "bunx",
-                    args: &["skills", "update", "--global"],
-                },
-            ],
+            commands: vec![CommandSpec {
+                program: "pnpm",
+                args: &["up", "-g"],
+            }],
+        },
+        WorkGroup {
+            name: "Global skills",
+            commands: vec![CommandSpec {
+                program: "bunx",
+                args: &["skills", "update", "--global"],
+            }],
         },
         WorkGroup {
             name: ".NET tools",
@@ -764,6 +765,14 @@ fn project_tasks(home: &Path, deep: bool) -> Vec<ProjectTask> {
                 args: &["sync", "-U"],
             }],
         },
+        ProjectTask {
+            name: "project: ponytail",
+            dir: home.join("Documents").join("source").join("ponytail"),
+            commands: vec![CommandSpec {
+                program: "git",
+                args: &["pull"],
+            }],
+        },
     ]
 }
 
@@ -824,6 +833,13 @@ mod tests {
     }
 
     #[test]
+    fn defaults_to_four_project_jobs() {
+        let cli = Cli::parse_from(["daily-ups"]);
+
+        assert_eq!(cli.jobs, 4);
+    }
+
+    #[test]
     fn command_display_includes_arguments() {
         let command = CommandSpec {
             program: "dotnet",
@@ -831,6 +847,32 @@ mod tests {
         };
 
         assert_eq!(command.display(), "dotnet build -c Release");
+    }
+
+    #[test]
+    fn global_skills_are_reported_as_their_own_group() {
+        let groups = tool_groups();
+        let global_skills = groups
+            .iter()
+            .find(|group| group.name == "Global skills")
+            .expect("global skills group exists");
+
+        assert_eq!(global_skills.commands.len(), 1);
+        assert_eq!(
+            global_skills.commands[0].display(),
+            "bunx skills update --global"
+        );
+
+        let node = groups
+            .iter()
+            .find(|group| group.name == "Node")
+            .expect("node group exists");
+        assert!(
+            !node
+                .commands
+                .iter()
+                .any(|command| command.display().contains("skills update"))
+        );
     }
 
     #[test]
@@ -864,6 +906,25 @@ mod tests {
     }
 
     #[test]
+    fn ponytail_project_only_pulls() {
+        let home = Path::new("/Users/example");
+        let ponytail = project_tasks(home, false)
+            .into_iter()
+            .find(|project| project.name == "project: ponytail")
+            .expect("ponytail project exists");
+
+        assert_eq!(
+            ponytail.dir,
+            Path::new("/Users/example")
+                .join("Documents")
+                .join("source")
+                .join("ponytail")
+        );
+        assert_eq!(ponytail.commands.len(), 1);
+        assert_eq!(ponytail.commands[0].display(), "git pull");
+    }
+
+    #[test]
     fn dry_run_with_missing_project_dirs_skips_projects() {
         let home = tempdir().expect("create temp home");
         let cli = Cli {
@@ -874,7 +935,7 @@ mod tests {
 
         let summary = run_with_home(cli, home.path().to_path_buf()).expect("run dry-run");
 
-        assert_eq!(summary.skipped.len(), 4);
+        assert_eq!(summary.skipped.len(), 5);
         assert_eq!(summary.exit_code(), 1);
     }
 
