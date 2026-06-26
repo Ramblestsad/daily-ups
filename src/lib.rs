@@ -1,14 +1,18 @@
 use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use owo_colors::OwoColorize;
+use std::collections::VecDeque;
 use std::env;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use thiserror::Error;
-use time::{OffsetDateTime, format_description};
+use time::{Duration, OffsetDateTime, format_description};
+
+const LOG_RETENTION_DAYS: i64 = 7;
 
 #[derive(Debug, Parser)]
 #[command(name = "daily-ups")]
@@ -22,6 +26,9 @@ pub struct Cli {
 
     #[arg(long, default_value_t = 4)]
     pub jobs: usize,
+
+    #[arg(long)]
+    pub verbose_log: bool,
 }
 
 #[derive(Debug, Error)]
@@ -128,7 +135,12 @@ pub fn run_with_home(cli: Cli, home: PathBuf) -> Result<RunSummary, AppError> {
     } else {
         format!("Mode: default, project jobs: {jobs}")
     };
-    logger.line_colored(&mode, Tone::Muted);
+    let log_mode = if cli.verbose_log {
+        format!("{mode}, verbose log")
+    } else {
+        mode
+    };
+    logger.line_colored(&log_mode, Tone::Muted);
 
     if let Some(record) = log_failure {
         records.push(record);
@@ -142,7 +154,7 @@ pub fn run_with_home(cli: Cli, home: PathBuf) -> Result<RunSummary, AppError> {
     }
     logger.line_colored(&format!("  - Projects (jobs: {jobs})"), Tone::Muted);
 
-    let outputs = run_parallel(cli.dry_run, cli.deep, jobs, &home);
+    let outputs = run_parallel(cli.dry_run, cli.deep, cli.verbose_log, jobs, &home);
 
     for output in outputs {
         if cli.dry_run {
@@ -175,19 +187,34 @@ fn validate_jobs(jobs: usize) -> Result<usize, AppError> {
 }
 
 fn timestamp() -> Result<String, AppError> {
+    timestamp_at(OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc()))
+}
+
+fn timestamp_at(time: OffsetDateTime) -> Result<String, AppError> {
     let format =
         format_description::parse_borrowed::<2>("[year]-[month]-[day]_[hour]-[minute]-[second]")?;
+    Ok(time.format(&format)?)
+}
+
+fn retention_cutoff_log_name() -> Result<String, AppError> {
     let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
-    Ok(now.format(&format)?)
+    Ok(format!(
+        "{}.log",
+        timestamp_at(now - Duration::days(LOG_RETENTION_DAYS))?
+    ))
 }
 
 impl Logger {
     fn new(home: &Path) -> Result<(Self, Option<StepRecord>), AppError> {
         let log_dir = home.join("Library").join("Logs").join("daily-ups");
         let log_name = format!("{}.log", timestamp()?);
+        let cutoff_log_name = retention_cutoff_log_name()?;
         let log_path = log_dir.join(log_name);
 
-        match fs::create_dir_all(&log_dir).and_then(|()| File::create(&log_path)) {
+        match fs::create_dir_all(&log_dir).and_then(|()| {
+            let _ = prune_old_logs(&log_dir, &cutoff_log_name);
+            File::create(&log_path)
+        }) {
             Ok(file) => Ok((
                 Self {
                     file: Some(file),
@@ -242,6 +269,38 @@ impl Logger {
             let _ = file.flush();
         }
     }
+}
+
+fn prune_old_logs(log_dir: &Path, cutoff_log_name: &str) -> io::Result<()> {
+    for entry in fs::read_dir(log_dir)? {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+
+        if is_daily_log_name(name) && name < cutoff_log_name && path.is_file() {
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    Ok(())
+}
+
+fn is_daily_log_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    bytes.len() == 23
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[10] == b'_'
+        && bytes[13] == b'-'
+        && bytes[16] == b'-'
+        && &bytes[19..] == b".log"
+        && [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18]
+            .into_iter()
+            .all(|index| bytes[index].is_ascii_digit())
 }
 
 fn styled(text: &str, tone: Tone) -> String {
@@ -329,7 +388,13 @@ fn print_list(logger: &mut Logger, title: &str, values: &[String], tone: Tone) {
     }
 }
 
-fn run_parallel(dry_run: bool, deep: bool, jobs: usize, home: &Path) -> Vec<WorkOutput> {
+fn run_parallel(
+    dry_run: bool,
+    deep: bool,
+    verbose_log: bool,
+    jobs: usize,
+    home: &Path,
+) -> Vec<WorkOutput> {
     let progress = MultiProgress::with_draw_target(ProgressDrawTarget::stderr());
     let style = progress_style();
 
@@ -341,7 +406,7 @@ fn run_parallel(dry_run: bool, deep: bool, jobs: usize, home: &Path) -> Vec<Work
             bar.set_style(style.clone());
             bar.set_prefix(group.name.to_string());
             bar.set_message("queued");
-            thread::spawn(move || (index, run_work_group(group, dry_run, bar)))
+            thread::spawn(move || (index, run_work_group(group, dry_run, verbose_log, bar)))
         })
         .collect::<Vec<_>>();
 
@@ -356,7 +421,8 @@ fn run_parallel(dry_run: bool, deep: bool, jobs: usize, home: &Path) -> Vec<Work
             (project, bar)
         })
         .collect::<Vec<_>>();
-    let project_handle = thread::spawn(move || run_projects(project_bars, jobs, dry_run));
+    let project_handle =
+        thread::spawn(move || run_projects(project_bars, jobs, dry_run, verbose_log));
 
     let mut tool_outputs = join_indexed_outputs(tool_handles);
     let project_output = match project_handle.join() {
@@ -400,7 +466,12 @@ fn panic_output(name: &'static str, reason: &'static str) -> WorkOutput {
     }
 }
 
-fn run_work_group(group: WorkGroup, dry_run: bool, bar: ProgressBar) -> WorkOutput {
+fn run_work_group(
+    group: WorkGroup,
+    dry_run: bool,
+    verbose_log: bool,
+    bar: ProgressBar,
+) -> WorkOutput {
     let mut log = String::new();
     log.push_str(&format!("\n===> {}\n", group.name));
 
@@ -409,6 +480,7 @@ fn run_work_group(group: WorkGroup, dry_run: bool, bar: ProgressBar) -> WorkOutp
         None,
         &group.commands,
         dry_run,
+        verbose_log,
         &mut log,
         Some(&bar),
     );
@@ -424,27 +496,38 @@ fn run_projects(
     projects: Vec<(ProjectTask, ProgressBar)>,
     jobs: usize,
     dry_run: bool,
+    verbose_log: bool,
 ) -> WorkOutput {
     let mut indexed_outputs = Vec::with_capacity(projects.len());
-
-    for (batch_index, chunk) in projects.chunks(jobs).enumerate() {
-        let batch_start = batch_index * jobs;
-        let handles = chunk
-            .iter()
-            .cloned()
-            .enumerate()
-            .map(|(chunk_index, (project, bar))| {
-                let project_index = batch_start + chunk_index;
-                thread::spawn(move || (project_index, run_project(project, dry_run, bar)))
-            })
-            .collect::<Vec<_>>();
-
-        for handle in handles {
-            match handle.join() {
-                Ok((project_index, output)) => indexed_outputs.push((project_index, output)),
-                Err(_) => {
-                    indexed_outputs.push((usize::MAX, panic_output("Project", "worker panicked")))
+    let worker_count = jobs.min(projects.len());
+    let queue = Arc::new(Mutex::new(
+        projects.into_iter().enumerate().collect::<VecDeque<_>>(),
+    ));
+    let handles = (0..worker_count)
+        .map(|_| {
+            let queue = Arc::clone(&queue);
+            thread::spawn(move || {
+                let mut outputs = Vec::new();
+                loop {
+                    let next = queue.lock().expect("project queue poisoned").pop_front();
+                    let Some((project_index, (project, bar))) = next else {
+                        break;
+                    };
+                    outputs.push((
+                        project_index,
+                        run_project(project, dry_run, verbose_log, bar),
+                    ));
                 }
+                outputs
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for handle in handles {
+        match handle.join() {
+            Ok(outputs) => indexed_outputs.extend(outputs),
+            Err(_) => {
+                indexed_outputs.push((usize::MAX, panic_output("Project", "worker panicked")))
             }
         }
     }
@@ -463,7 +546,12 @@ fn run_projects(
     WorkOutput { records, log }
 }
 
-fn run_project(project: ProjectTask, dry_run: bool, bar: ProgressBar) -> WorkOutput {
+fn run_project(
+    project: ProjectTask,
+    dry_run: bool,
+    verbose_log: bool,
+    bar: ProgressBar,
+) -> WorkOutput {
     let mut log = String::new();
     log.push_str(&format!("\n--- {}\n", project.name));
     log.push_str(&format!("Directory: {}\n", project.dir.display()));
@@ -530,6 +618,7 @@ fn run_project(project: ProjectTask, dry_run: bool, bar: ProgressBar) -> WorkOut
         Some(project.dir.as_path()),
         &project.commands,
         dry_run,
+        verbose_log,
         &mut log,
         Some(&bar),
     );
@@ -546,6 +635,7 @@ fn run_commands(
     current_dir: Option<&Path>,
     commands: &[CommandSpec],
     dry_run: bool,
+    verbose_log: bool,
     log: &mut String,
     bar: Option<&ProgressBar>,
 ) -> StepRecord {
@@ -564,14 +654,19 @@ fn run_commands(
 
         match run_command(command, current_dir) {
             Ok(output) => {
-                log.push_str(&output);
+                if verbose_log {
+                    log.push_str(&output);
+                }
                 if let Some(bar) = bar {
                     bar.inc(1);
                 }
             }
-            Err(reason) => {
-                log.push_str(&format!("FAIL: {reason}\n"));
-                return StepRecord::failure(name, reason);
+            Err(failure) => {
+                if !failure.output.is_empty() {
+                    log.push_str(&failure.output);
+                }
+                log.push_str(&format!("FAIL: {}\n", failure.reason));
+                return StepRecord::failure(name, failure.reason);
             }
         }
     }
@@ -588,7 +683,16 @@ fn finish_bar(bar: &ProgressBar, name: &str, status: &StepStatus) {
     }
 }
 
-fn run_command(command: &CommandSpec, current_dir: Option<&Path>) -> Result<String, String> {
+#[derive(Debug)]
+struct CommandFailure {
+    reason: String,
+    output: String,
+}
+
+fn run_command(
+    command: &CommandSpec,
+    current_dir: Option<&Path>,
+) -> Result<String, CommandFailure> {
     let mut process = Command::new(command.program);
     process.args(command.args);
 
@@ -596,9 +700,10 @@ fn run_command(command: &CommandSpec, current_dir: Option<&Path>) -> Result<Stri
         process.current_dir(dir);
     }
 
-    let output = process
-        .output()
-        .map_err(|error| format!("failed to start `{}`: {error}", command.display()))?;
+    let output = process.output().map_err(|error| CommandFailure {
+        reason: format!("failed to start `{}`: {error}", command.display()),
+        output: String::new(),
+    })?;
 
     let mut log = String::new();
     for bytes in [&output.stdout, &output.stderr] {
@@ -619,7 +724,10 @@ fn run_command(command: &CommandSpec, current_dir: Option<&Path>) -> Result<Stri
             .status
             .code()
             .map_or_else(|| "signal".to_string(), |code| code.to_string());
-        Err(format!("`{}` exited with {code}", command.display()))
+        Err(CommandFailure {
+            reason: format!("`{}` exited with {code}", command.display()),
+            output: log,
+        })
     }
 }
 
@@ -931,6 +1039,7 @@ mod tests {
             dry_run: true,
             deep: false,
             jobs: 2,
+            verbose_log: false,
         };
 
         let summary = run_with_home(cli, home.path().to_path_buf()).expect("run dry-run");
@@ -959,6 +1068,7 @@ mod tests {
                 commands: rust_project_commands(false),
             },
             true,
+            false,
             hidden_bar(2),
         );
 
@@ -966,6 +1076,124 @@ mod tests {
             output.records.first().map(|record| &record.status),
             Some(StepStatus::Skipped(reason)) if reason == "1 local change(s)"
         ));
+    }
+
+    #[test]
+    fn project_jobs_refill_when_one_finishes() {
+        use std::time::{Duration, Instant};
+
+        const FAST: &[&str] = &["-c", "sleep 0.05"];
+        const SLOW: &[&str] = &["-c", "sleep 0.5"];
+
+        let home = tempdir().expect("create temp home");
+        let projects = vec![
+            test_project(home.path(), "project: slow-1", "slow-1", SLOW),
+            test_project(home.path(), "project: fast-1", "fast-1", FAST),
+            test_project(home.path(), "project: fast-2", "fast-2", FAST),
+            test_project(home.path(), "project: fast-3", "fast-3", FAST),
+            test_project(home.path(), "project: slow-2", "slow-2", SLOW),
+        ];
+
+        let started = Instant::now();
+        let output = run_projects(projects, 4, false, false);
+
+        assert!(
+            started.elapsed() < Duration::from_millis(900),
+            "projects waited for the whole first batch before refilling"
+        );
+        assert_eq!(output.records.len(), 5);
+        assert!(
+            output
+                .records
+                .iter()
+                .all(|record| record.status == StepStatus::Success)
+        );
+    }
+
+    #[test]
+    fn default_log_omits_success_output_but_keeps_failure_output() {
+        let dir = tempdir().expect("create temp dir");
+        let dir_text = dir.path().display().to_string();
+        let mut success_log = String::new();
+
+        let success = run_commands(
+            "success",
+            Some(dir.path()),
+            &[CommandSpec {
+                program: "pwd",
+                args: &[],
+            }],
+            false,
+            false,
+            &mut success_log,
+            None,
+        );
+
+        assert_eq!(success.status, StepStatus::Success);
+        assert!(success_log.contains("> pwd\n"));
+        assert!(success_log.contains("OK\n"));
+        assert!(!success_log.contains(&dir_text));
+
+        let mut failure_log = String::new();
+        let failure = run_commands(
+            "failure",
+            Some(dir.path()),
+            &[CommandSpec {
+                program: "sh",
+                args: &["-c", "pwd; exit 9"],
+            }],
+            false,
+            false,
+            &mut failure_log,
+            None,
+        );
+
+        assert!(matches!(failure.status, StepStatus::Failure(_)));
+        assert!(failure_log.contains(&dir_text));
+        assert!(failure_log.contains("FAIL: `sh -c pwd; exit 9` exited with 9\n"));
+    }
+
+    #[test]
+    fn verbose_log_keeps_success_output() {
+        let dir = tempdir().expect("create temp dir");
+        let mut log = String::new();
+
+        let record = run_commands(
+            "success",
+            Some(dir.path()),
+            &[CommandSpec {
+                program: "pwd",
+                args: &[],
+            }],
+            false,
+            true,
+            &mut log,
+            None,
+        );
+
+        assert_eq!(record.status, StepStatus::Success);
+        assert!(log.contains(&dir.path().display().to_string()));
+    }
+
+    #[test]
+    fn prunes_logs_older_than_cutoff() {
+        let dir = tempdir().expect("create temp dir");
+        let old_log = dir.path().join("2026-06-18_10-00-00.log");
+        let cutoff_log = dir.path().join("2026-06-19_10-00-00.log");
+        let new_log = dir.path().join("2026-06-20_10-00-00.log");
+        let other_log = dir.path().join("notes.log");
+
+        fs::write(&old_log, "old").expect("write old log");
+        fs::write(&cutoff_log, "cutoff").expect("write cutoff log");
+        fs::write(&new_log, "new").expect("write new log");
+        fs::write(&other_log, "other").expect("write other log");
+
+        prune_old_logs(dir.path(), "2026-06-19_10-00-00.log").expect("prune logs");
+
+        assert!(!old_log.exists());
+        assert!(cutoff_log.exists());
+        assert!(new_log.exists());
+        assert!(other_log.exists());
     }
 
     #[test]
@@ -980,6 +1208,28 @@ mod tests {
             failure.map(|record| record.status),
             Some(StepStatus::Failure(_))
         ));
+    }
+
+    fn test_project(
+        root: &Path,
+        name: &'static str,
+        dir_name: &str,
+        args: &'static [&'static str],
+    ) -> (ProjectTask, ProgressBar) {
+        let dir = root.join(dir_name);
+        fs::create_dir_all(&dir).expect("create project dir");
+        git(&dir, &["init"]);
+        (
+            ProjectTask {
+                name,
+                dir,
+                commands: vec![CommandSpec {
+                    program: "sh",
+                    args,
+                }],
+            },
+            hidden_bar(1),
+        )
     }
 
     fn git(dir: &Path, args: &[&str]) {
