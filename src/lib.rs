@@ -148,11 +148,14 @@ pub fn run_with_home(cli: Cli, home: PathBuf) -> Result<RunSummary, AppError> {
 
     logger.line("");
     logger.line("");
-    logger.line_colored("Parallel groups", Tone::Header);
+    logger.line_colored("Update order", Tone::Header);
     for group in tool_groups() {
         logger.line_colored(&format!("  - {}", group.name), Tone::Muted);
     }
-    logger.line_colored(&format!("  - Projects (jobs: {jobs})"), Tone::Muted);
+    logger.line_colored(
+        &format!("  - Projects after toolchains (jobs: {jobs})"),
+        Tone::Muted,
+    );
 
     let outputs = run_parallel(cli.dry_run, cli.deep, cli.verbose_log, jobs, &home);
 
@@ -395,10 +398,26 @@ fn run_parallel(
     jobs: usize,
     home: &Path,
 ) -> Vec<WorkOutput> {
+    run_workflows(
+        tool_groups(),
+        project_tasks(home, deep),
+        dry_run,
+        verbose_log,
+        jobs,
+    )
+}
+
+fn run_workflows(
+    tool_groups: Vec<WorkGroup>,
+    projects: Vec<ProjectTask>,
+    dry_run: bool,
+    verbose_log: bool,
+    jobs: usize,
+) -> Vec<WorkOutput> {
     let progress = MultiProgress::with_draw_target(ProgressDrawTarget::stderr());
     let style = progress_style();
 
-    let tool_handles = tool_groups()
+    let tool_handles = tool_groups
         .into_iter()
         .enumerate()
         .map(|(index, group)| {
@@ -410,8 +429,9 @@ fn run_parallel(
         })
         .collect::<Vec<_>>();
 
-    let project_home = home.to_path_buf();
-    let project_bars = project_tasks(&project_home, deep)
+    let mut outputs = join_indexed_outputs(tool_handles);
+
+    let project_bars = projects
         .into_iter()
         .map(|project| {
             let bar = progress.add(ProgressBar::new(project.commands.len() as u64));
@@ -421,16 +441,8 @@ fn run_parallel(
             (project, bar)
         })
         .collect::<Vec<_>>();
-    let project_handle =
-        thread::spawn(move || run_projects(project_bars, jobs, dry_run, verbose_log));
-
-    let mut tool_outputs = join_indexed_outputs(tool_handles);
-    let project_output = match project_handle.join() {
-        Ok(output) => output,
-        Err(_) => panic_output("Projects", "worker panicked"),
-    };
-    tool_outputs.push(project_output);
-    tool_outputs
+    outputs.push(run_projects(project_bars, jobs, dry_run, verbose_log));
+    outputs
 }
 
 fn progress_style() -> ProgressStyle {
@@ -1111,6 +1123,44 @@ mod tests {
     }
 
     #[test]
+    fn projects_start_after_tool_groups_finish() {
+        let home = tempdir().expect("create temp home");
+        let marker = home.path().join("tool.done");
+        let project_dir = home.path().join("project");
+        fs::create_dir_all(&project_dir).expect("create project dir");
+        git(&project_dir, &["init"]);
+
+        let outputs = run_workflows(
+            vec![WorkGroup {
+                name: "slow tool",
+                commands: vec![CommandSpec {
+                    program: "sh",
+                    args: sh_args(format!("sleep 0.2; touch {}", shell_quote(&marker))),
+                }],
+            }],
+            vec![ProjectTask {
+                name: "project: waits",
+                dir: project_dir,
+                commands: vec![CommandSpec {
+                    program: "sh",
+                    args: sh_args(format!("test -f {}", shell_quote(&marker))),
+                }],
+            }],
+            false,
+            false,
+            1,
+        );
+
+        let statuses = outputs
+            .into_iter()
+            .flat_map(|output| output.records)
+            .map(|record| record.status)
+            .collect::<Vec<_>>();
+
+        assert_eq!(statuses, vec![StepStatus::Success, StepStatus::Success]);
+    }
+
+    #[test]
     fn default_log_omits_success_output_but_keeps_failure_output() {
         let dir = tempdir().expect("create temp dir");
         let dir_text = dir.path().display().to_string();
@@ -1245,5 +1295,14 @@ mod tests {
         let bar = ProgressBar::hidden();
         bar.set_length(len);
         bar
+    }
+
+    fn sh_args(command: String) -> &'static [&'static str] {
+        let command = Box::leak(command.into_boxed_str());
+        Box::leak(vec!["-c", command].into_boxed_slice())
+    }
+
+    fn shell_quote(path: &Path) -> String {
+        format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
     }
 }
