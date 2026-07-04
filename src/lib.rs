@@ -920,7 +920,7 @@ fn rust_project_commands(deep: bool) -> Vec<CommandSpec> {
 fn dotnet_project_commands(deep: bool) -> Vec<CommandSpec> {
     let mut commands = vec![CommandSpec {
         program: "dotnet",
-        args: &["outdated", "-u", "-i"],
+        args: &["outdated", "-u", "-i", "-exc", "Microsoft.OpenApi"],
     }];
 
     if deep {
@@ -1023,6 +1023,16 @@ mod tests {
 
         assert!(!rust_commands.contains(&"cargo clean".to_string()));
         assert!(!dotnet_commands.contains(&"dotnet clean".to_string()));
+    }
+
+    #[test]
+    fn dotnet_update_excludes_microsoft_openapi() {
+        let commands = dotnet_project_commands(false)
+            .into_iter()
+            .map(|command| command.display())
+            .collect::<Vec<_>>();
+
+        assert!(commands.contains(&"dotnet outdated -u -i -exc Microsoft.OpenApi".to_string()));
     }
 
     #[test]
