@@ -814,8 +814,8 @@ fn tool_groups() -> Vec<WorkGroup> {
         WorkGroup {
             name: "Global skills",
             commands: vec![CommandSpec {
-                program: "bunx",
-                args: &["skills", "update", "--global"],
+                program: "deno",
+                args: &["x", "-A", "npm:skills", "update", "--global"],
             }],
         },
         WorkGroup {
@@ -980,7 +980,7 @@ mod tests {
         assert_eq!(global_skills.commands.len(), 1);
         assert_eq!(
             global_skills.commands[0].display(),
-            "bunx skills update --global"
+            "deno x -A npm:skills update --global"
         );
 
         let node = groups
