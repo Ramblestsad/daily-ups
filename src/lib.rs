@@ -10,9 +10,10 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use thiserror::Error;
-use time::{Duration, OffsetDateTime, format_description};
+use time::{format_description, Duration, OffsetDateTime};
 
 const LOG_RETENTION_DAYS: i64 = 7;
+const MAX_UPDATE_LINES: usize = 8;
 
 #[derive(Debug, Parser)]
 #[command(name = "daily-ups")]
@@ -56,6 +57,7 @@ pub enum StepStatus {
 pub struct StepRecord {
     name: String,
     status: StepStatus,
+    changes: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +65,7 @@ pub struct RunSummary {
     pub successes: Vec<String>,
     pub failures: Vec<String>,
     pub skipped: Vec<String>,
+    pub updates: Vec<(String, Vec<String>)>,
     pub log_path: Option<PathBuf>,
 }
 
@@ -317,17 +320,27 @@ fn styled(text: &str, tone: Tone) -> String {
 }
 
 impl StepRecord {
-    fn success(name: impl Into<String>) -> Self {
+    fn success_with_changes(name: impl Into<String>, changes: Vec<String>) -> Self {
         Self {
             name: name.into(),
             status: StepStatus::Success,
+            changes,
         }
     }
 
     fn failure(name: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::failure_with_changes(name, reason, Vec::new())
+    }
+
+    fn failure_with_changes(
+        name: impl Into<String>,
+        reason: impl Into<String>,
+        changes: Vec<String>,
+    ) -> Self {
         Self {
             name: name.into(),
             status: StepStatus::Failure(reason.into()),
+            changes,
         }
     }
 
@@ -335,6 +348,7 @@ impl StepRecord {
         Self {
             name: name.into(),
             status: StepStatus::Skipped(reason.into()),
+            changes: Vec::new(),
         }
     }
 }
@@ -343,11 +357,18 @@ fn summarize(records: Vec<StepRecord>, log_path: Option<PathBuf>) -> RunSummary 
     let mut successes = Vec::new();
     let mut failures = Vec::new();
     let mut skipped = Vec::new();
+    let mut updates = Vec::new();
 
     for record in records {
         match record.status {
-            StepStatus::Success => successes.push(record.name),
-            StepStatus::Failure(reason) => failures.push(format!("{}: {reason}", record.name)),
+            StepStatus::Success => {
+                successes.push(record.name.clone());
+                push_updates(&mut updates, record.name, record.changes);
+            }
+            StepStatus::Failure(reason) => {
+                failures.push(format!("{}: {reason}", record.name));
+                push_updates(&mut updates, record.name, record.changes);
+            }
             StepStatus::Skipped(reason) => skipped.push(format!("{}: {reason}", record.name)),
         }
     }
@@ -356,8 +377,24 @@ fn summarize(records: Vec<StepRecord>, log_path: Option<PathBuf>) -> RunSummary 
         successes,
         failures,
         skipped,
+        updates,
         log_path,
     }
+}
+
+fn push_updates(updates: &mut Vec<(String, Vec<String>)>, name: String, changes: Vec<String>) {
+    if changes.is_empty() {
+        return;
+    }
+
+    let lines = if changes.len() > MAX_UPDATE_LINES {
+        let mut lines = changes[..MAX_UPDATE_LINES].to_vec();
+        lines.push(format!("... (+{} more)", changes.len() - MAX_UPDATE_LINES));
+        lines
+    } else {
+        changes
+    };
+    updates.push((name, lines));
 }
 
 fn print_summary(logger: &mut Logger, summary: &RunSummary, dry_run: bool) {
@@ -368,6 +405,7 @@ fn print_summary(logger: &mut Logger, summary: &RunSummary, dry_run: bool) {
         print_list(logger, "Would run:", &summary.successes, Tone::Muted);
     } else {
         print_list(logger, "Succeeded:", &summary.successes, Tone::Success);
+        print_updates(logger, &summary.updates);
     }
 
     print_list(logger, "Failed:", &summary.failures, Tone::Failure);
@@ -388,6 +426,21 @@ fn print_list(logger: &mut Logger, title: &str, values: &[String], tone: Tone) {
 
     for value in values {
         logger.line_colored(&format!("  - {value}"), tone);
+    }
+}
+
+fn print_updates(logger: &mut Logger, updates: &[(String, Vec<String>)]) {
+    logger.line_colored("Updated:", Tone::Success);
+    if updates.is_empty() {
+        logger.line_colored("  none", Tone::Muted);
+        return;
+    }
+
+    for (name, lines) in updates {
+        logger.line_colored(&format!("  {name}:"), Tone::Muted);
+        for line in lines {
+            logger.line_colored(&format!("    - {line}"), Tone::Muted);
+        }
     }
 }
 
@@ -651,6 +704,8 @@ fn run_commands(
     log: &mut String,
     bar: Option<&ProgressBar>,
 ) -> StepRecord {
+    let mut changes = Vec::new();
+
     for command in commands {
         if let Some(bar) = bar {
             bar.set_message(command.display());
@@ -666,6 +721,7 @@ fn run_commands(
 
         match run_command(command, current_dir) {
             Ok(output) => {
+                changes.extend(update_lines(&output));
                 if verbose_log {
                     log.push_str(&output);
                 }
@@ -674,17 +730,38 @@ fn run_commands(
                 }
             }
             Err(failure) => {
+                changes.extend(update_lines(&failure.output));
                 if !failure.output.is_empty() {
                     log.push_str(&failure.output);
                 }
                 log.push_str(&format!("FAIL: {}\n", failure.reason));
-                return StepRecord::failure(name, failure.reason);
+                return StepRecord::failure_with_changes(name, failure.reason, changes);
             }
         }
     }
 
     log.push_str("OK\n");
-    StepRecord::success(name)
+    StepRecord::success_with_changes(name, changes)
+}
+
+fn update_lines(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| {
+            let lower = line.to_ascii_lowercase();
+            if lower.starts_with("error") || lower.starts_with("fail") || lower.starts_with("warn")
+            {
+                return false;
+            }
+            line.contains("->")
+                || line.contains('→')
+                || lower.contains("updat")
+                || lower.contains("upgrad")
+        })
+        .map(str::to_string)
+        .collect()
 }
 
 fn finish_bar(bar: &ProgressBar, name: &str, status: &StepStatus) {
@@ -785,6 +862,19 @@ impl CommandSpec {
 fn tool_groups() -> Vec<WorkGroup> {
     vec![
         WorkGroup {
+            name: "mise",
+            commands: vec![
+                CommandSpec {
+                    program: "mise",
+                    args: &["self-update"],
+                },
+                CommandSpec {
+                    program: "mise",
+                    args: &["up"],
+                },
+            ],
+        },
+        WorkGroup {
             name: "Homebrew",
             commands: vec![
                 CommandSpec {
@@ -798,6 +888,7 @@ fn tool_groups() -> Vec<WorkGroup> {
             ],
         },
         WorkGroup {
+            // mise covers stable + configured targets; rustup also refreshes the nightly toolchain
             name: "Rust",
             commands: vec![CommandSpec {
                 program: "rustup",
@@ -987,12 +1078,91 @@ mod tests {
             .iter()
             .find(|group| group.name == "Node")
             .expect("node group exists");
-        assert!(
-            !node
-                .commands
-                .iter()
-                .any(|command| command.display().contains("skills update"))
+        assert!(!node
+            .commands
+            .iter()
+            .any(|command| command.display().contains("skills update")));
+    }
+
+    #[test]
+    fn mise_group_runs_first_and_updates_mise_then_tools() {
+        let groups = tool_groups();
+
+        assert_eq!(groups[0].name, "mise");
+        let displays = groups[0]
+            .commands
+            .iter()
+            .map(|command| command.display())
+            .collect::<Vec<_>>();
+        assert_eq!(displays, vec!["mise self-update", "mise up"]);
+    }
+
+    #[test]
+    fn update_lines_keep_upgrade_lines_and_drop_noise() {
+        let output = concat!(
+            "noise line\n",
+            "wget 1.24.5 -> 1.25.0\n",
+            "  stable-aarch64-apple-darwin updated - rustc 1.98.0\n",
+            "stable-x86_64 unchanged - rustc 1.97.1\n",
+            "dev 3.0.0 → 3.1.0\n",
+            "==> Upgrading openssl\n",
+            "error: failed to update toolchain\n",
+            "plain text\n",
         );
+
+        assert_eq!(
+            update_lines(output),
+            vec![
+                "wget 1.24.5 -> 1.25.0",
+                "stable-aarch64-apple-darwin updated - rustc 1.98.0",
+                "dev 3.0.0 → 3.1.0",
+                "==> Upgrading openssl",
+            ]
+        );
+    }
+
+    #[test]
+    fn summarize_groups_updates_by_step_and_keeps_failure_updates() {
+        let records = vec![
+            StepRecord::success_with_changes("mise", vec!["node 24.19.0 -> 24.20.1".to_string()]),
+            StepRecord::failure_with_changes(
+                "Homebrew",
+                "brew upgrade failed",
+                vec!["wget 1.24.5 -> 1.25.0".to_string()],
+            ),
+            StepRecord::skipped("Rust", "no rustup"),
+        ];
+
+        let summary = summarize(records, None);
+
+        assert_eq!(
+            summary.updates,
+            vec![
+                (
+                    "mise".to_string(),
+                    vec!["node 24.19.0 -> 24.20.1".to_string()]
+                ),
+                (
+                    "Homebrew".to_string(),
+                    vec!["wget 1.24.5 -> 1.25.0".to_string()]
+                ),
+            ]
+        );
+        assert!(summary.failures[0].contains("brew upgrade failed"));
+        assert!(summary.skipped[0].contains("no rustup"));
+    }
+
+    #[test]
+    fn updates_are_capped_with_more_count() {
+        let changes = (0..10)
+            .map(|index| format!("pkg{index} 1.0 -> 1.1"))
+            .collect();
+        let mut updates = Vec::new();
+
+        push_updates(&mut updates, "cargo".to_string(), changes);
+
+        assert_eq!(updates[0].1.len(), MAX_UPDATE_LINES + 1);
+        assert_eq!(updates[0].1.last().unwrap(), "... (+2 more)");
     }
 
     #[test]
@@ -1124,12 +1294,10 @@ mod tests {
             "projects waited for the whole first batch before refilling"
         );
         assert_eq!(output.records.len(), 5);
-        assert!(
-            output
-                .records
-                .iter()
-                .all(|record| record.status == StepStatus::Success)
-        );
+        assert!(output
+            .records
+            .iter()
+            .all(|record| record.status == StepStatus::Success));
     }
 
     #[test]
