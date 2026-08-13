@@ -978,7 +978,7 @@ fn project_tasks(home: &Path, deep: bool) -> Vec<ProjectTask> {
         },
         ProjectTask {
             name: "project: ponytail",
-            dir: home.join("Documents").join("source").join("ponytail"),
+            dir: home.join("skills").join("ponytail"),
             commands: vec![CommandSpec {
                 program: "git",
                 args: &["pull"],
@@ -1215,10 +1215,7 @@ mod tests {
 
         assert_eq!(
             ponytail.dir,
-            Path::new("/Users/example")
-                .join("Documents")
-                .join("source")
-                .join("ponytail")
+            Path::new("/Users/example").join("skills").join("ponytail")
         );
         assert_eq!(ponytail.commands.len(), 1);
         assert_eq!(ponytail.commands[0].display(), "git pull");
