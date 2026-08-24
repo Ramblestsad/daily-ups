@@ -10,7 +10,7 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use thiserror::Error;
-use time::{format_description, Duration, OffsetDateTime};
+use time::{Duration, OffsetDateTime, format_description};
 
 const LOG_RETENTION_DAYS: i64 = 7;
 const MAX_UPDATE_LINES: usize = 8;
@@ -910,6 +910,20 @@ fn tool_groups() -> Vec<WorkGroup> {
             }],
         },
         WorkGroup {
+            name: "Pi",
+            commands: vec![CommandSpec {
+                program: "pi",
+                args: &["update", "--all"],
+            }],
+        },
+        WorkGroup {
+            name: "Grok",
+            commands: vec![CommandSpec {
+                program: "grok",
+                args: &["update"],
+            }],
+        },
+        WorkGroup {
             name: ".NET tools",
             commands: vec![CommandSpec {
                 program: "dotnet",
@@ -1078,10 +1092,12 @@ mod tests {
             .iter()
             .find(|group| group.name == "Node")
             .expect("node group exists");
-        assert!(!node
-            .commands
-            .iter()
-            .any(|command| command.display().contains("skills update")));
+        assert!(
+            !node
+                .commands
+                .iter()
+                .any(|command| command.display().contains("skills update"))
+        );
     }
 
     #[test]
@@ -1095,6 +1111,18 @@ mod tests {
             .map(|command| command.display())
             .collect::<Vec<_>>();
         assert_eq!(displays, vec!["mise self-update", "mise up"]);
+    }
+
+    #[test]
+    fn pi_and_grok_are_updated() {
+        let commands = tool_groups()
+            .into_iter()
+            .flat_map(|group| group.commands)
+            .map(|command| command.display())
+            .collect::<Vec<_>>();
+
+        assert!(commands.contains(&"pi update --all".to_string()));
+        assert!(commands.contains(&"grok update".to_string()));
     }
 
     #[test]
@@ -1291,10 +1319,12 @@ mod tests {
             "projects waited for the whole first batch before refilling"
         );
         assert_eq!(output.records.len(), 5);
-        assert!(output
-            .records
-            .iter()
-            .all(|record| record.status == StepStatus::Success));
+        assert!(
+            output
+                .records
+                .iter()
+                .all(|record| record.status == StepStatus::Success)
+        );
     }
 
     #[test]
