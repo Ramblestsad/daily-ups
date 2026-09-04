@@ -905,15 +905,16 @@ fn tool_groups() -> Vec<WorkGroup> {
         WorkGroup {
             name: "Global skills",
             commands: vec![CommandSpec {
-                program: "deno",
-                args: &["x", "-A", "npm:skills", "update", "--global"],
+                program: "bun",
+                args: &["x", "--bun", "skills", "update", "--global"],
             }],
         },
         WorkGroup {
+            // pnpm updates Pi itself; only update extensions here to avoid concurrent self-updates.
             name: "Pi",
             commands: vec![CommandSpec {
                 program: "pi",
-                args: &["update", "--all"],
+                args: &["update", "--extensions"],
             }],
         },
         WorkGroup {
@@ -995,7 +996,23 @@ fn project_tasks(home: &Path, deep: bool) -> Vec<ProjectTask> {
             dir: home.join("skills").join("ponytail"),
             commands: vec![CommandSpec {
                 program: "git",
-                args: &["pull"],
+                args: &["pull", "--ff-only"],
+            }],
+        },
+        ProjectTask {
+            name: "project: dotnet-skills",
+            dir: home.join("skills").join("dotnet-skills"),
+            commands: vec![CommandSpec {
+                program: "git",
+                args: &["pull", "--ff-only"],
+            }],
+        },
+        ProjectTask {
+            name: "project: waza",
+            dir: home.join("skills").join("waza"),
+            commands: vec![CommandSpec {
+                program: "git",
+                args: &["pull", "--ff-only"],
             }],
         },
     ]
@@ -1085,7 +1102,7 @@ mod tests {
         assert_eq!(global_skills.commands.len(), 1);
         assert_eq!(
             global_skills.commands[0].display(),
-            "deno x -A npm:skills update --global"
+            "bun x --bun skills update --global"
         );
 
         let node = groups
@@ -1121,7 +1138,9 @@ mod tests {
             .map(|command| command.display())
             .collect::<Vec<_>>();
 
-        assert!(commands.contains(&"pi update --all".to_string()));
+        assert!(commands.contains(&"pnpm up -g".to_string()));
+        assert!(commands.contains(&"pi update --extensions".to_string()));
+        assert!(!commands.contains(&"pi update --all".to_string()));
         assert!(commands.contains(&"grok update".to_string()));
     }
 
@@ -1234,19 +1253,20 @@ mod tests {
     }
 
     #[test]
-    fn ponytail_project_only_pulls() {
+    fn skill_repositories_only_pull_fast_forward() {
         let home = Path::new("/Users/example");
-        let ponytail = project_tasks(home, false)
-            .into_iter()
-            .find(|project| project.name == "project: ponytail")
-            .expect("ponytail project exists");
-
-        assert_eq!(
-            ponytail.dir,
-            Path::new("/Users/example").join("skills").join("ponytail")
-        );
-        assert_eq!(ponytail.commands.len(), 1);
-        assert_eq!(ponytail.commands[0].display(), "git pull");
+        for deep in [false, true] {
+            let projects = project_tasks(home, deep);
+            for name in ["ponytail", "dotnet-skills", "waza"] {
+                let dir = home.join("skills").join(name);
+                let project = projects
+                    .iter()
+                    .find(|project| project.dir == dir)
+                    .expect("skill repository exists");
+                assert_eq!(project.commands.len(), 1);
+                assert_eq!(project.commands[0].display(), "git pull --ff-only");
+            }
+        }
     }
 
     #[test]
@@ -1261,7 +1281,7 @@ mod tests {
 
         let summary = run_with_home(cli, home.path().to_path_buf()).expect("run dry-run");
 
-        assert_eq!(summary.skipped.len(), 5);
+        assert_eq!(summary.skipped.len(), 7);
         assert_eq!(summary.exit_code(), 1);
     }
 
