@@ -96,6 +96,25 @@ struct ProjectTask {
     name: &'static str,
     dir: PathBuf,
     commands: Vec<CommandSpec>,
+    require_git: bool,
+}
+
+impl ProjectTask {
+    fn new(name: &'static str, dir: PathBuf, commands: Vec<CommandSpec>) -> Self {
+        Self {
+            name,
+            dir,
+            commands,
+            require_git: true,
+        }
+    }
+
+    fn without_git(self) -> Self {
+        Self {
+            require_git: false,
+            ..self
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -632,49 +651,51 @@ fn run_project(
         };
     }
 
-    match is_git_repository(&project.dir) {
-        Ok(true) => {}
-        Ok(false) => {
-            let reason = format!("not a git repository: {}", project.dir.display());
-            log.push_str(&format!("SKIP: {reason}\n"));
-            let record = StepRecord::skipped(project.name, reason);
-            finish_bar(&bar, project.name, &record.status);
-            return WorkOutput {
-                records: vec![record],
-                log,
-            };
+    if project.require_git {
+        match is_git_repository(&project.dir) {
+            Ok(true) => {}
+            Ok(false) => {
+                let reason = format!("not a git repository: {}", project.dir.display());
+                log.push_str(&format!("SKIP: {reason}\n"));
+                let record = StepRecord::skipped(project.name, reason);
+                finish_bar(&bar, project.name, &record.status);
+                return WorkOutput {
+                    records: vec![record],
+                    log,
+                };
+            }
+            Err(reason) => {
+                log.push_str(&format!("FAIL: {reason}\n"));
+                let record = StepRecord::failure(project.name, reason);
+                finish_bar(&bar, project.name, &record.status);
+                return WorkOutput {
+                    records: vec![record],
+                    log,
+                };
+            }
         }
-        Err(reason) => {
-            log.push_str(&format!("FAIL: {reason}\n"));
-            let record = StepRecord::failure(project.name, reason);
-            finish_bar(&bar, project.name, &record.status);
-            return WorkOutput {
-                records: vec![record],
-                log,
-            };
-        }
-    }
 
-    match local_change_count(&project.dir) {
-        Ok(0) => {}
-        Ok(count) => {
-            let reason = format!("{count} local change(s)");
-            log.push_str(&format!("SKIP: {reason}\n"));
-            let record = StepRecord::skipped(project.name, reason);
-            finish_bar(&bar, project.name, &record.status);
-            return WorkOutput {
-                records: vec![record],
-                log,
-            };
-        }
-        Err(reason) => {
-            log.push_str(&format!("FAIL: {reason}\n"));
-            let record = StepRecord::failure(project.name, reason);
-            finish_bar(&bar, project.name, &record.status);
-            return WorkOutput {
-                records: vec![record],
-                log,
-            };
+        match local_change_count(&project.dir) {
+            Ok(0) => {}
+            Ok(count) => {
+                let reason = format!("{count} local change(s)");
+                log.push_str(&format!("SKIP: {reason}\n"));
+                let record = StepRecord::skipped(project.name, reason);
+                finish_bar(&bar, project.name, &record.status);
+                return WorkOutput {
+                    records: vec![record],
+                    log,
+                };
+            }
+            Err(reason) => {
+                log.push_str(&format!("FAIL: {reason}\n"));
+                let record = StepRecord::failure(project.name, reason);
+                finish_bar(&bar, project.name, &record.status);
+                return WorkOutput {
+                    records: vec![record],
+                    log,
+                };
+            }
         }
     }
 
@@ -960,61 +981,85 @@ fn tool_groups() -> Vec<WorkGroup> {
 
 fn project_tasks(home: &Path, deep: bool) -> Vec<ProjectTask> {
     vec![
-        ProjectTask {
-            name: "project: lrs",
-            dir: home
-                .join("Documents")
+        ProjectTask::new(
+            "project: lrs",
+            home.join("Documents")
                 .join("source")
                 .join("rust")
                 .join("lrs"),
-            commands: rust_project_commands(deep),
-        },
-        ProjectTask {
-            name: "project: axes",
-            dir: home
-                .join("Documents")
+            rust_project_commands(deep),
+        ),
+        ProjectTask::new(
+            "project: axes",
+            home.join("Documents")
                 .join("source")
                 .join("rust")
                 .join("axes"),
-            commands: rust_project_commands(deep),
-        },
-        ProjectTask {
-            name: "project: lcsSln",
-            dir: home.join("Documents").join("source").join("lcsSln"),
-            commands: dotnet_project_commands(deep),
-        },
-        ProjectTask {
-            name: "project: lpy",
-            dir: home.join("Documents").join("source").join("lpy"),
-            commands: vec![CommandSpec {
+            rust_project_commands(deep),
+        ),
+        ProjectTask::new(
+            "project: lcsSln",
+            home.join("Documents").join("source").join("lcsSln"),
+            dotnet_project_commands(deep),
+        ),
+        ProjectTask::new(
+            "project: lpy",
+            home.join("Documents").join("source").join("lpy"),
+            vec![CommandSpec {
                 program: "uv",
                 args: &["sync", "-U"],
             }],
-        },
-        ProjectTask {
-            name: "project: ponytail",
-            dir: home.join("skills").join("ponytail"),
-            commands: vec![CommandSpec {
+        ),
+        ProjectTask::new(
+            "project: black-rim",
+            home.join("Documents")
+                .join("source")
+                .join("black-rim")
+                .join("black-rim"),
+            rust_project_commands(deep),
+        ),
+        ProjectTask::new(
+            "project: sts",
+            home.join("Documents").join("source").join("sts"),
+            vec![CommandSpec {
+                program: "bun",
+                args: &["update"],
+            }],
+        )
+        .without_git(),
+        ProjectTask::new(
+            "project: gg",
+            home.join("Documents").join("source").join("gg"),
+            vec![CommandSpec {
+                program: "go",
+                args: &["get", "-u", "./..."],
+            }],
+        )
+        .without_git(),
+        ProjectTask::new(
+            "project: ponytail",
+            home.join("skills").join("ponytail"),
+            vec![CommandSpec {
                 program: "git",
                 args: &["pull", "--ff-only"],
             }],
-        },
-        ProjectTask {
-            name: "project: dotnet-skills",
-            dir: home.join("skills").join("dotnet-skills"),
-            commands: vec![CommandSpec {
+        ),
+        ProjectTask::new(
+            "project: dotnet-skills",
+            home.join("skills").join("dotnet-skills"),
+            vec![CommandSpec {
                 program: "git",
                 args: &["pull", "--ff-only"],
             }],
-        },
-        ProjectTask {
-            name: "project: waza",
-            dir: home.join("skills").join("waza"),
-            commands: vec![CommandSpec {
+        ),
+        ProjectTask::new(
+            "project: waza",
+            home.join("skills").join("waza"),
+            vec![CommandSpec {
                 program: "git",
                 args: &["pull", "--ff-only"],
             }],
-        },
+        ),
     ]
 }
 
@@ -1253,6 +1298,70 @@ mod tests {
     }
 
     #[test]
+    fn black_rim_uses_rust_project_commands() {
+        let home = Path::new("/Users/example");
+        let dir = home
+            .join("Documents")
+            .join("source")
+            .join("black-rim")
+            .join("black-rim");
+
+        for deep in [false, true] {
+            let projects = project_tasks(home, deep);
+            let project = project_by_name(&projects, "project: black-rim");
+            assert_eq!(project.dir, dir);
+            assert!(project.require_git);
+            assert_eq!(
+                command_displays(&project.commands),
+                command_displays(&rust_project_commands(deep))
+            );
+        }
+    }
+
+    #[test]
+    fn sts_and_gg_update_without_git() {
+        let home = Path::new("/Users/example");
+        let projects = project_tasks(home, false);
+
+        let sts = project_by_name(&projects, "project: sts");
+        assert_eq!(sts.dir, home.join("Documents").join("source").join("sts"));
+        assert!(!sts.require_git);
+        assert_eq!(command_displays(&sts.commands), vec!["bun update"]);
+
+        let gg = project_by_name(&projects, "project: gg");
+        assert_eq!(gg.dir, home.join("Documents").join("source").join("gg"));
+        assert!(!gg.require_git);
+        assert_eq!(command_displays(&gg.commands), vec!["go get -u ./..."]);
+    }
+
+    #[test]
+    fn unguarded_project_runs_without_git() {
+        let home = tempdir().expect("create temp home");
+        let project_dir = home.path().join("sts");
+        fs::create_dir_all(&project_dir).expect("create project dir");
+
+        let output = run_project(
+            ProjectTask::new(
+                "project: sts",
+                project_dir,
+                vec![CommandSpec {
+                    program: "bun",
+                    args: &["update"],
+                }],
+            )
+            .without_git(),
+            true,
+            false,
+            hidden_bar(1),
+        );
+
+        assert_eq!(
+            output.records.first().map(|record| &record.status),
+            Some(&StepStatus::Success)
+        );
+    }
+
+    #[test]
     fn skill_repositories_only_pull_fast_forward() {
         let home = Path::new("/Users/example");
         for deep in [false, true] {
@@ -1281,7 +1390,7 @@ mod tests {
 
         let summary = run_with_home(cli, home.path().to_path_buf()).expect("run dry-run");
 
-        assert_eq!(summary.skipped.len(), 7);
+        assert_eq!(summary.skipped.len(), 10);
         assert_eq!(summary.exit_code(), 1);
     }
 
@@ -1299,11 +1408,7 @@ mod tests {
         fs::write(project_dir.join("dirty.txt"), "changed").expect("write dirty file");
 
         let output = run_project(
-            ProjectTask {
-                name: "project: lrs",
-                dir: project_dir,
-                commands: rust_project_commands(false),
-            },
+            ProjectTask::new("project: lrs", project_dir, rust_project_commands(false)),
             true,
             false,
             hidden_bar(2),
@@ -1363,14 +1468,14 @@ mod tests {
                     args: sh_args(format!("sleep 0.2; touch {}", shell_quote(&marker))),
                 }],
             }],
-            vec![ProjectTask {
-                name: "project: waits",
-                dir: project_dir,
-                commands: vec![CommandSpec {
+            vec![ProjectTask::new(
+                "project: waits",
+                project_dir,
+                vec![CommandSpec {
                     program: "sh",
                     args: sh_args(format!("test -f {}", shell_quote(&marker))),
                 }],
-            }],
+            )],
             false,
             false,
             1,
@@ -1485,6 +1590,17 @@ mod tests {
         ));
     }
 
+    fn project_by_name<'a>(projects: &'a [ProjectTask], name: &str) -> &'a ProjectTask {
+        projects
+            .iter()
+            .find(|project| project.name == name)
+            .unwrap_or_else(|| panic!("{name} exists"))
+    }
+
+    fn command_displays(commands: &[CommandSpec]) -> Vec<String> {
+        commands.iter().map(|command| command.display()).collect()
+    }
+
     fn test_project(
         root: &Path,
         name: &'static str,
@@ -1495,14 +1611,14 @@ mod tests {
         fs::create_dir_all(&dir).expect("create project dir");
         git(&dir, &["init"]);
         (
-            ProjectTask {
+            ProjectTask::new(
                 name,
                 dir,
-                commands: vec![CommandSpec {
+                vec![CommandSpec {
                     program: "sh",
                     args,
                 }],
-            },
+            ),
             hidden_bar(1),
         )
     }
