@@ -887,7 +887,7 @@ fn tool_groups() -> Vec<WorkGroup> {
             commands: vec![
                 CommandSpec {
                     program: "mise",
-                    args: &["self-update"],
+                    args: &["self-update", "--yes"],
                 },
                 CommandSpec {
                     program: "mise",
@@ -1172,7 +1172,7 @@ mod tests {
             .iter()
             .map(|command| command.display())
             .collect::<Vec<_>>();
-        assert_eq!(displays, vec!["mise self-update", "mise up"]);
+        assert_eq!(displays, vec!["mise self-update --yes", "mise up"]);
     }
 
     #[test]
